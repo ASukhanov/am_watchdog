@@ -4,7 +4,8 @@
 #__version__ = 'v02 2016-11-01' # minMax, okFail
 #__version__ = 'v04 2016-11-02' # from cad import
 #__version__ = 'v06 2016-11-02' # Lots of mods: LifeS, LifeM, reset, sysName-dependend watchlist.
-__version__ = 'v07 2016-11-05'  # Command Restart.
+#__version__ = 'v07 2016-11-05'  # Stop: Restart.
+__version__ = 'v08 2016-11-07'  # Moving average added.
 
 
 mgrName = 'am_watchdog'
@@ -42,32 +43,28 @@ inform = False # debugging of cns
 from cad import am
 am.debug = True # debugging of am
 
+class MovingAverage:
+    def __init__(self,width):
+        self.list = [0 for x in range(width)]
+        self.ma = 0.
+        self.width = float(width)
+    def __call__(self,xx):
+        self.ma -= self.list.pop()/self.width
+        self.ma += xx/self.width
+        self.list.insert(0,xx)
+        return self.ma
+
 class ParSetter:
     '''This class is needed to redirect parameter setting function back to AMWatchdog.'''
     def __init__(self,amw,index):
         self.amw = amw
         self.index = index
     def parInSet(self): self.amw.parInSet(self.index)
+    def parAverageSet(self): self.amw.parAverageSet(self.index)
     def parOutSet(self): self.amw.parOutSet(self.index)
     def parReset(self): self.amw.parReset(self.index)
 #,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
-'''
-class Req:
-    def __init__():
-        self.list = []
-        self.idx = []
-    def append(self,item,idx):
-        self.list.append(item)
-        self.idx.append(idx)
-    def remove(self,nn):
-        self.list.remove(nn)
-        self.idx.add(nn)
-    def (self,nn):
-        self.list.remove(nn)
-        self.idx.add(nn)
-''' 
 server = None
-AddTimeStamps = False #TODO: Some parameters unexpectedly turn pink. Setting this True does not help. 
 #'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 class AMWatchdog:
     def __init__(self,dbg=0):
@@ -79,26 +76,22 @@ class AMWatchdog:
 
         self.statusM = am.adoParameter("statusM", 'StringType', 1, 0, cns.Feature.DIAGNOSTIC, '')
         self.statusM.add("desc", "status")
-        if AddTimeStamps: self.statusM.add("timestamps", 0)
             
         self.commandS = am.adoParameter("stopS", 'StringType', 1, 0,
                                      cns.Feature.DISCRETE | cns.Feature.WRITABLE|cns.Feature.EDITABLE,"Pause")
         self.commandS.add("desc", "Pause, Continue, Server exit")
         self.commandS.add("legalValues", "Pause,Continue,Exit,Restart")
         self.commandS.set = self.command_set
-        if AddTimeStamps: self.commandS.add("timestamps", 0)
 
         self.resetS = am.adoParameter('ResetS', 'StringType', 1, 0,
             cns.Feature.DISCRETE | cns.Feature.WRITABLE|cns.Feature.EDITABLE,"Trips")
         self.resetS.add("desc", "reset all parameters")
         self.resetS.add("legalValues", "Trips,Init")
         self.resetS.set = self.reset
-        if AddTimeStamps: self.resetS.add("timestamps", 0)
 
         self.sleepS = am.adoParameter("sleepS", 'DoubleType', 1, 0,
             cns.Feature.WRITABLE|cns.Feature.EDITABLE, 1)
         self.sleepS.add("desc", "sleep time [s] between checks")
-        if AddTimeStamps: self.sleepS.add("timestamps", 0)
 
         self.dbg = dbg
         self.dbgS = am.adoParameter("debugS", 'IntType', 1, 0,
@@ -106,7 +99,6 @@ class AMWatchdog:
         self.dbgS.add("desc", "debug flag, bit0 for debugging am.py, the rest for self")
         self.dbgS.set = self.dbgSet
         self.dbgSet()
-        if AddTimeStamps: self.dbgS.add("timestamps", 0)
 
         self.countM = am.adoParameter("countM", 'IntType', 1, 0,cns.Feature.DIAGNOSTIC,0)
         self.countM.add("desc", "check counter")
@@ -118,8 +110,10 @@ class AMWatchdog:
         self.parsetter = []         # ParSetter classes
         self.parInS = []            # ado:parameter names of input parameters
         self.parInM = []            # current values of parIn's
-        self.parMinS = []              # minimums of tolerance intervals
-        self.parMaxS = []              # maximums of tolerance intervals
+        self.parAverageS = []       # ado:parameter names of input parameters
+        self.ma = []                # moving average class of the parIn
+        self.parMinS = []           # minimums of tolerance intervals
+        self.parMaxS = []           # maximums of tolerance intervals
         self.parOutS = []           # ado:parameter names of output parameters
         self.parOutM = []           # current values of parOut's
         self.parLifeM = []          # numbers of allowed failures until parameter trips
@@ -139,24 +133,24 @@ class AMWatchdog:
             self.parInS[ii].add('desc','ado:parameter name of the parameter to watch')
             self.parInS[ii].set = self.parsetter[ii].parInSet
             self.parInSet(ii)           
-            if AddTimeStamps: self.parInS[ii].add("timestamps", 0)
 
             # add current value of the watched parameter
             self.parInM.append(am.adoParameter('parInM_'+str(ii), 'DoubleType', 1, 0,0,0))
             self.parInM[ii].add('desc','current value of the watched parameter')
-            if AddTimeStamps: self.parInM[ii].add("timestamps", 0)
+            
+            self.parAverageS.append(am.adoParameter('parAverageS_'+str(ii), 'DoubleType', 1, 0,0,1))
+            self.parAverageS[ii].add('desc','width of the averaging window')
+            self.parAverageS[ii].set = self.parsetter[ii].parAverageSet
             
             # add minimum of the tolerance interval
             self.parMinS.append(am.adoParameter('parMinS_'+str(ii), 'DoubleType', 1, 0,
                 cns.Feature.WRITABLE|cns.Feature.EDITABLE, item[ParMin]))
             self.parMinS[ii].add('desc','minimum of the tolerance interval')
-            if AddTimeStamps: self.parMinS[ii].add("timestamps", 0)
             
             # add max of the tolerance interval
             self.parMaxS.append(am.adoParameter('parMaxS_'+str(ii), 'DoubleType', 1, 0,
                 cns.Feature.WRITABLE|cns.Feature.EDITABLE, item[ParMax]))
             self.parMaxS[ii].add('desc','maximum of the tolerance interval')
-            if AddTimeStamps: self.parMaxS[ii].add("timestamps", 0)
 
             self.parOutM.append(am.adoParameter('parOutM_'+str(ii), 'StringType',1,0,0,'Undefined'))
             self.parOutM[ii].add('desc','current value of parOut, None if not set.')
@@ -167,17 +161,14 @@ class AMWatchdog:
             self.parOutS[ii].add('desc','output parameter, which will be tripped, depending on parInM')
             self.parOutS[ii].set = self.parsetter[ii].parOutSet
             self.parOutSet(ii)
-            if AddTimeStamps: self.parOutS[ii].add("timestamps", 0)
             
             self.parTripS.append(am.adoParameter('parTripS_'+str(ii), 'DoubleType', 1, 0,
                 cns.Feature.WRITABLE|cns.Feature.EDITABLE, item[ParTripS]))
             self.parTripS[ii].add('desc',"trip value to be set to parOut when parIn trips")
-            if AddTimeStamps: self.parTripS[ii].add("timestamps", 0)
             
             self.parLifeS.append(am.adoParameter('parLifeS_'+str(ii), 'DoubleType', 1, 0,
                 cns.Feature.WRITABLE|cns.Feature.EDITABLE, item[ParLife]))
             self.parLifeS[ii].add('desc',"number of allowed failures until parameter trips")            
-            if AddTimeStamps: self.parLifeS[ii].add("timestamps", 0)
 
             self.parLifeM.append(am.adoParameter('parLifeM_'+str(ii), 'DoubleType', 1, 0,
                 cns.Feature.WRITABLE|cns.Feature.EDITABLE, 0))
@@ -188,7 +179,6 @@ class AMWatchdog:
             self.parResetS[ii].add("desc", "reset tripped parameter")
             self.parResetS[ii].set = self.parsetter[ii].parReset
             self.parReset(ii)
-            if AddTimeStamps: self.parResetS[ii].add("timestamps", 0)
 
             # all done
             ii += 1
@@ -225,9 +215,13 @@ class AMWatchdog:
             msg = 'WARNING. '+str(self.parInS[ind].name)+' will not be watched. '+str(e)
             self.update_status(msg)
             print(msg)
-        if adoIn: 
+        if adoIn:
+            self.parAverageSet(ind)
             self.dictAdoGet[str(ind)] = [adoIn,pname,'value']
             if self.dbg&4: print('requestGet['+str(ind)+'] added')
+            
+    def parAverageSet(self,ind):
+        self.ma[ind] = MovingAverage(self.parAverageS[ind].value.value)        
 
     def parOutSet(self,ind):
         if self.requestsAdoSet[ind][0] != None : 
@@ -301,8 +295,9 @@ class AMWatchdog:
         indexes = [int(ii) for ii in self.dictAdoGet.keys()]
         if self.dbg&4: print('process_data:'+str(self.countM.value.value))
         for ii in range(len(data)):
-            vv = data[ii][0]
             idx = indexes[ii]
+            vv = data[ii][0]
+            vv = self.ma[idx](vv)) # moving average of the value
             self.parInM[idx].value.value = vv
             self.parInM[idx].updateValueTimestamp()  # update current parameter value
             #vo = None
